@@ -1,0 +1,285 @@
+---
+title: "5foldscv"
+author: "Safa MADDOURI"
+date: "2023-03-01"
+output: html_document
+---
+
+
+```{r}
+# Remove N/A and the count<100
+row_sums <- apply(gene_couts_38N_vs_71T[, -1], 1, sum, na.rm = TRUE)
+count_filtered <- gene_couts_38N_vs_71T[row_sums >= 100, ]
+log2FC_cutoff <- 0.5 # for example, for log2FC > 1 (upregulated) or log2FC < -1 (downregulated)
+padj_cutoff <- 0.05 # for example, adjusted p-value < 0.05
+```
+
+```{r}
+draw_ROC <- function(truth_vec, proba_vec, plot = TRUE) {
+  # Draw a ROC curve of from input vectors.
+  # Returns the empirical AUC and the threshold to use for classification to maximise the accuracy.
+  # @truth_vec: vector of character, real label of samples
+  # @proba_vec: vector of numeric, probability of predicted class
+  suppressPackageStartupMessages(library(ROCR))
+  suppressPackageStartupMessages(library(pROC))
+
+  # ROCR object for performance evaluation
+  rocr_pred <- prediction(proba_vec, truth_vec)
+  rocr_perf <- performance(rocr_pred, "tpr", "fpr")
+ 
+  # AUC
+  auc <- performance(rocr_pred, measure = "auc")@y.values[[1]]
+  auc_to_display <- paste0("AUC: ", round(auc, 3))
+ 
+  # Cutoff
+  # https://www.r-bloggers.com/2014/12/a-small-introduction-to-the-rocr-package/
+  cost <- performance(rocr_pred, measure = "cost")
+  cutoff <- rocr_pred@cutoffs[[1]][which.min(cost@y.values[[1]])]
+  cutoff_to_display <- paste0("Threshold for classification: ", round(cutoff, 3))
+ 
+  cutoff_acc <- performance(rocr_pred, measure = "phi") # Matthews Correlation Coefficient
+  ind <- which.max(slot(cutoff_acc, "y.values")[[1]])
+  max_acc <- slot(cutoff_acc, "x.values")[[1]][ind]
+ 
+  # ROC curve
+  if (plot == TRUE) {
+    ROCR::plot(rocr_perf, colorize = FALSE, lwd = 1.5)
+    abline(a = 0, b = 1, lty = 3, lwd = 1)
+    text(0.7,
+         0.2,
+         auc_to_display)
+    text(0.7,
+         0.1,
+         cutoff_to_display)
+    
+    #plot(cutoff_acc)
+    #text(0.6,
+    #     max_acc,
+    #     cutoff_to_display)
+    #abline(v = max_acc, lty = 3)
+  }
+ 
+  return(list("auc" = auc,
+              "cutoff" = cutoff))  
+}
+```
+
+```{r}
+library(DESeq2)
+library(dplyr)
+library(glmnet)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+
+```{r}
+# create an empty list to store the results
+prob_list <- list()
+lasso_genes_list <- list()
+
+# loop over the five folds
+for (i in 0:4) {
+  # select the current train and test data
+  train <- get(paste0("sampleshuf.train", i))
+  test <- get(paste0("sampleshuf.test", i))
+  
+  # subset the count matrix based on the current train data
+  count_sub <- count_filtered[, train$V1]
+  test_sub <- count_filtered[, test$V1]
+  colnames(train)[2] <- "cond"
+  # create the DESeq2 dataset
+  dds <- DESeqDataSetFromMatrix(countData = count_sub, colData = train, design = ~ cond)
+  
+  # run DESeq2 analysis
+  dds <- DESeq(dds)
+  ddsResults <- results(dds, contrast=c("cond", "normal", "tumoral"))
+  feature <- count_filtered$feature
+  resultdeseq<- cbind(feature = feature, ddsResults)
+ 
+  # Filter out rows with missing values
+  complete_cases <- complete.cases(resultdeseq)
+  resultdeseq <- resultdeseq[complete_cases,]
+  # Calculate a combined metric for prioritizing genes (Pi)
+  resultdeseq$Pi <- abs(-log10(resultdeseq$pvalue) *(resultdeseq$log2FoldChange))
+  # Sort the results based on the combined metric
+  sorted_result <- resultdeseq[order(-resultdeseq$Pi), ]
+  # Select the top 40 differentially expressed genes
+  top40 <- sorted_result[1:40, ]
+  # Combine features and count data for training set
+  Trainn=cbind(feature,count_sub)## T0 with features 
+  top40=data.frame(top40)
+  
+ # Merge the top 40 genes with training data
+  diff_genes_count <- inner_join(top40, Trainn, by = "feature") %>%
+  filter(feature %in% top40$feature)
+  duplicate_rows <- duplicated(top40$feature, fromLast = FALSE)
+  # Remove duplicate rows from the data frame
+  diff_genes_count <- diff_genes_count[!duplicate_rows,]
+  diff_genes_count <- diff_genes_count[, -c(2:8)]
+  
+ # Transpose the differential gene count matrix
+
+  diff_genes_countt=t(diff_genes_count)
+  # Set new column names based on the first row of the transposed matrix
+
+  new_colnames <- as.character(diff_genes_countt[1, ])
+# Remove the first row from the data frame
+  diff_genes_countt<- diff_genes_countt[-1, ]
+  colnames(diff_genes_countt) <- new_colnames
+# Convert the differential gene count matrix to numeric values
+  diff_genes_trans <- apply(diff_genes_countt, 2, as.numeric)
+  rownames(diff_genes_trans)=rownames(diff_genes_countt)
+  
+  # Prepare the test data for prediction
+  test_sub=cbind(feature,test_sub)
+  testt=t(test_sub)
+  colnames(testt)=testt[1,]
+  testt=testt[-1,]
+  testtt <- apply(testt, 2, as.numeric)
+  rownames(testtt)=rownames(testt)
+  
+  
+  ## Perform Lasso regression ##
+
+  # Set the seed for reproducibility of random numbers
+  
+  set.seed(1000)
+  # Fit the Lasso model using cross-validation to determine the optimal lambda value  
+  cv_fit <- cv.glmnet(diff_genes_trans, train$cond, family="binomial", alpha=1, nfolds=10)
+  # Get the coefficients of the Lasso model at the lambda value that minimizes the cross-validation error
+  diff_genes_lasso <- coef(cv_fit, s=cv_fit$lambda.min)[-1, 1] # exclude the intercept term
+  
+  # Select the names of the non-zero coefficients, representing the selected genes
+  diff_genes_lasso <- names(diff_genes_lasso[diff_genes_lasso != 0]) 
+  # Extract the columns of the training data corresponding to the selected genes
+  train_X_diff_lasso <- diff_genes_trans[, diff_genes_lasso]
+  # Extract the columns of the test data corresponding to the selected genes
+  test_X_diff_lasso <- testtt[, diff_genes_lasso]
+  # Fit the Lasso model using the selected genes on the training data
+  lasso_fit <- glmnet(train_X_diff_lasso,train$cond, family="binomial", alpha=1, lambda=cv_fit$lambda.min)
+
+  # Predict the test labels and store the probability table
+  test_probs <- predict(lasso_fit, newx=test_X_diff_lasso, type="response")
+  prob_table <- data.frame(test_probs)
+  # Assign labels based on row names
+  prob_table$label <- ifelse(substr(rownames(prob_table), 1, 3) == "nor", "normal", 
+                             ifelse(substr(rownames(prob_table), 1, 3) == "tum", "tumoral", NA))
+  
+  # Set column names of the probability table
+  colnames(prob_table) <- c("Proba", "Label")
+  # Store the probability table and selected genes for this fold
+  prob_list[[i+1]] <- prob_table
+  lasso_genes_list[[i+1]] <- diff_genes_lasso
+}
+```
+
+```{r}
+# Combine the probability tables from each fold into a single table
+combined_table <- do.call(rbind, prob_list)
+# Plot the ROC curve and calculate the AUC
+draw_ROC(truth_vec = combined_table$Label, proba_vec = combined_table$Proba, plot = TRUE)
+# Calculate the AUC without plotting the ROC curve
+draw_ROC(truth_vec = combined_table$Label, proba_vec = combined_table$Proba, plot = FALSE)$auc
+
+```
+```{r}
+# Predict labels based on a probability threshold
+predicted_labels <- ifelse(combined_table$Proba > 0.5, "tumor", "normal")
+# Create a confusion matrix based on predicted and true labels
+confusion_matrix <- table(predicted_labels, combined_table$Label)
+# Calculate sensitivity (true positive rate)
+sensitivity <- confusion_matrix[2, 2] / sum(confusion_matrix[2, ])
+# Calculate specificity (true negative rate)
+specificity <- confusion_matrix[1, 1] / sum(confusion_matrix[1, ])
+# Calculate balanced accuracy
+balanced_accuracy <- (sensitivity + specificity) / 2
+balanced_accuracy
+
+
+
+```
+
+
+
+```{r}
+lasso_genes_list <- lapply(lasso_genes_list, as.data.frame)
+#Remove the '.' character and what is after it in the ensembl gene name 
+lasso_genes_list <- lapply(lasso_genes_list  , function(x) {
+    x[, 1] <- gsub('[.]{1}[0-9]+[_]{1}[A-Z]+|[.]{1}[0-9]+|[.]{1}[0-9]+[_]{1}[A-Z]+[_]{1}[A-Z]+','',x[, 1])
+  return(x)
+})
+
+# Retrieve the gene name for the symbol information (ensembl name) in lasso_genes_list using the org.Hs.eg.db database
+lasso_genes_symbol_list <- lapply(lasso_genes_list, function(x) {
+  x$symbol <- AnnotationDbi::select(org.Hs.eg.db, keys=x[,1], columns="SYMBOL", keytype="ENSEMBL")
+  return(x)
+})
+for (i in 1:5){
+  write.csv(lasso_genes_symbol_list[i],paste("lasso_genes_symbol",i))
+}
+##Get all the genes selected by the lasso in each fold in one list with removing the duplictes
+all_lassogene_symbol <- do.call(rbind,lasso_genes_symbol_list)
+all_lassogene_symbol<-distinct(all_lassogene_symbol)
+write.csv(all_lassogene_symbol,"all_lassogene_symbol")
+ 
+```
+
+```{r}
+library(org.Hs.eg.db)
+# Clean the gene names in the first column of count_filtered (Remove the "." in the Ensembl gene name)
+count_filtered[,1]=gsub('[.]{1}[0-9]+[_]{1}[A-Z]+|[.]{1}[0-9]+|[.]{1}[0-9]+[_]{1}[A-Z]+[_]{1}[A-Z]+','',count_filtered[,1])
+rownames(count_filtered) <- NULL
+# Rename the column "symbol" in all_lassogene_symbol to "feature"
+colnames(all_lassogene_symbol)[1]<- "feature"
+# Inner join all_lassogene_symbol and count_filtered based on the "feature" column
+expression_data <- inner_join(all_lassogene_symbol, count_filtered, by = "feature") %>%
+filter(feature %in% count_filtered$feature)
+expression_data <- expression_data[,-1]
+#Remove duplicates
+expression_data <- unique(expression_data)
+#Remove NA values
+expression_data<-na.omit(expression_data)
+#complete cases
+expression_data <- expression_data[complete.cases(expression_data$symbol$SYMBOL), ]
+#Rownames=> Features (gene names)
+rownames(expression_data)=expression_data$symbol$SYMBOL
+expression_data <- expression_data[,-1]
+# Scale the data by subtracting the mean and dividing by the standard deviation
+scaled_mat <- t(scale(t(expression_data)))
+```
+
+
+
+
+
+```{r}
+
+condition <- c(rep("normal", 38),rep("tumor",71))
+condition <- factor(condition, levels = c("normal", "tumor"))
+
+indices_normal = grep("^normal",colnames(scaled_mat))
+normal_data=scaled_mat[, indices_normal]
+indices_tumor = grep("^tumor",colnames(scaled_mat))
+tumor_data<-scaled_mat[, indices_tumor]
+
+
+# Order the rows and columns of the two matrices separately
+normal_data <- normal_data[rev(order(rowMeans(normal_data))), order(colMeans(normal_data))]
+tumor_data <- tumor_data[rev(order(rowMeans(tumor_data))), order(colMeans(tumor_data))]
+
+# Define the color scheme for the heatmap
+col_fun <- colorRamp2(c(-4, 0, 4), c("blue", "white", "red"))
+
+# Create the heatmap using ComplexHeatmap
+
+# Add a column annotation to show the condition of each patient
+ha_column <- HeatmapAnnotation(condition = condition, col = list(condition = c(normal = "royalblue", tumor = "pink")), annotation_name_side = "left")
+
+ht <- Heatmap(cbind(normal_data, tumor_data), col = col_fun, name = "scaled expression", top_annotation =                ha_column,show_row_names = TRUE, show_column_names = TRUE, 
+              cluster_rows = TRUE, cluster_columns = FALSE,
+              row_dend_side = "left")
+
+
+```
